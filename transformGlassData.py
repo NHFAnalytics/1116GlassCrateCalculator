@@ -2,6 +2,16 @@ import os
 import pyodbc
 import polars as pl
 
+import gurobipy as gp
+from gurobipy import GRB
+
+pl.Config(
+    fmt_str_lengths = 1000, 
+    tbl_width_chars = 1000,
+    set_tbl_cols = 50,
+    set_tbl_rows = 100
+)
+
 
 def get_file_path(keyword:str):
     excel_path = f'{os.getcwd()}'
@@ -9,7 +19,6 @@ def get_file_path(keyword:str):
     file_path = f'{excel_path}\\{file}'
 
     return file_path
-
 
 def get_crate_data():
 
@@ -30,14 +39,16 @@ def get_crate_data():
         .with_columns(
             pl.col('no')
             .str.split("Sublot ").list.last()
-            .str.split(' ').list.first()
+            .str.split(' G').list.first()
             .alias('PO Sublot')
         )
         .rename({'crate no.': 'Crate Number', 'crate typ' : 'Crate Type', 'glass code' : 'Part Number', 'qty' : 'Crate Quantity'})
-        .select('Container Number', 'Crate Number', 'Crate Type', 'Part Number', 'Crate Quantity', 'PO Sublot', '# POs in Crate')
+        .select('Container Number', 'Crate Number', 'Crate Type', 'Part Number', 'Crate Quantity', 'PO Sublot', '# POs in Crate', 'UPDATED Sublot')
         .with_columns(
             pl.when(pl.col('# POs in Crate') == 1)
             .then(pl.col('PO Sublot'))
+            .when(pl.col('UPDATED Sublot').str != '')
+            .then(pl.col('UPDATED Sublot'))
             .otherwise(pl.lit(''))
             .alias('Sublot')
         )
@@ -67,6 +78,12 @@ def get_sublot_data():
             .otherwise(pl.col('Sublot'))
             .alias('Sublot')
         )
+        .with_columns(
+            pl.when(pl.col('Sublot').str.len_chars() < 4)
+            .then(pl.concat_str(pl.col('Sublot'), pl.lit('0')))
+            .otherwise(pl.col('Sublot'))
+            .alias('Sublot')
+        )
         .group_by('Sublot', 'Part Number').len()
         .rename({'len' : 'BOM Quantity'})
     )
@@ -76,14 +93,82 @@ def get_sublot_data():
     return parts, sublot_demand
 
 
-
-
-
 def main():
 
     containers, crates, crate_boms = get_crate_data()
 
     parts, sublot_demand = get_sublot_data()
+
+    clean_crate_boms = crate_boms.group_by('Part Number', 'Sublot').agg(pl.col('Crate Quantity').sum())
+
+   # sublot_demand = sublot_demand.filter(pl.col('Sublot').str.starts_with('2.')).filter(pl.col('Sublot') == '2.01')
+   # clean_crate_boms = clean_crate_boms.filter(pl.col('Sublot') == '2.01')
+
+    temp = (
+        sublot_demand
+        # NOTE only filtered to show phase 2
+        .join(clean_crate_boms, how='full', on=['Part Number', 'Sublot'])
+        .with_columns(
+            pl.coalesce(['Sublot', 'Sublot_right'])
+            .alias('Sublot')
+        )
+        .with_columns(
+            pl.coalesce(['Part Number', 'Part Number_right'])
+            .alias('Part Number')
+        )
+        .drop(['Sublot_right', 'Part Number_right'])
+        .fill_null(0)
+        .with_columns(
+            (pl.col('Crate Quantity') - pl.col('BOM Quantity'))
+            .alias('NET')
+        )
+    )
+
+    free_crates = (
+        crate_boms
+        .filter(pl.col('Sublot').is_null())
+        .group_by('Crate Number', 'Part Number')
+        .agg(pl.col('Crate Quantity').sum())
+        .join(crates, on = 'Crate Number')
+        .select('Container Number', 'Crate Number', 'Part Number', 'Crate Quantity')
+        .sort('Container Number', 'Crate Number', 'Part Number')
+    )
+
+    print('free crates')
+    print(free_crates)
+    print(free_crates.sum())
+
+    sublots = (
+        temp.group_by('Sublot')
+        .agg(pl.col('Crate Quantity').sum())
+        .filter(pl.col('Crate Quantity') > 0)
+        .filter(pl.col('Sublot').is_not_null())
+        .select('Sublot')
+        .sort('Sublot')
+    )
+
+    temp_2 = (
+        temp
+        .join(sublots, how = 'inner', on = 'Sublot')
+        .filter(pl.col('NET') < 0)
+        .sort('Sublot', 'Part Number')
+    )
+
+    print('unfulfilled demand')
+    print(temp_2)
+    print(temp_2.sum())
+
+    print(sublot_demand.filter((pl.col('Part Number') == '1116GLT01-10-0001')).filter(pl.col('Sublot') == '2.02'))
+    print(temp.filter(pl.col('Sublot') == '2.02').sort('Part Number'))
+
+    print(crate_boms.filter(pl.col('Sublot') == '2.02').group_by('Crate Number', 'Part Number').agg(pl.col('Crate Quantity').sum()).sort('Crate Number', 'Part Number'))
+
+
+    print('extras')
+    print(temp.filter((pl.col('NET') > 0) & (pl.col('Sublot').is_not_null())))
+
+    #print('missing')
+    #print(temp.join().filter(pl.col('NET') < 0))
 
     ## TO DO
     # stack demand and crates
