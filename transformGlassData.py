@@ -34,7 +34,8 @@ def get_crate_data():
     crate_boms = (
         pl.read_excel(
             source = file_path, 
-            sheet_name = 'Crate BOMs'
+            sheet_name = 'Crate BOMs',
+            schema_overrides={'PO Sublot': pl.Utf8, 'UPDATED Sublot': pl.Utf8}
         )   
         .with_columns(
             pl.col('no')
@@ -45,11 +46,17 @@ def get_crate_data():
         .rename({'crate no.': 'Crate Number', 'crate typ' : 'Crate Type', 'glass code' : 'Part Number', 'qty' : 'Crate Quantity'})
         .select('Container Number', 'Crate Number', 'Crate Type', 'Part Number', 'Crate Quantity', 'PO Sublot', '# POs in Crate', 'UPDATED Sublot')
         .with_columns(
+            pl.when(pl.col(pl.String).str.len_chars() == 0)
+            .then(None)
+            .otherwise(pl.col(pl.String))
+            .name.keep()
+        )
+        .with_columns(
             pl.when(pl.col('# POs in Crate') == 1)
             .then(pl.col('PO Sublot'))
-            .when(pl.col('UPDATED Sublot').str != '')
+            .when(~pl.col('UPDATED Sublot').is_null())
             .then(pl.col('UPDATED Sublot'))
-            .otherwise(pl.lit(''))
+            .otherwise(None)
             .alias('Sublot')
         )
     )
@@ -57,6 +64,9 @@ def get_crate_data():
     crates = crate_boms.select(pl.col('Crate Number', 'Crate Type', 'Container Number', 'Sublot')).unique()
 
     crate_boms = crate_boms.drop('Crate Type', 'Container Number')
+    
+    print(crate_boms)
+    print(crates)
 
     return containers, crates, crate_boms
 
@@ -92,6 +102,233 @@ def get_sublot_data():
 
     return parts, sublot_demand
 
+
+def linear_program(demand, crate_boms):
+
+    if crate_boms.is_empty():
+        print('all crates have been assigned sublots')
+    else:
+        demand = demand.with_columns(pl.col('Sublot').str.replace_all(' ', ''))
+
+        print('\n\n\n\n\nINSIDE DA LOOOOP\n\n')
+
+        # parts in shipped GCs
+        parts = crate_boms.select('Part Number').unique().sort('Part Number')['Part Number'].to_list()
+
+        # filter demand for parts already shipped
+        demand = (
+            demand
+            .filter(pl.col('Part Number').is_in(parts))
+            .with_columns(
+                pl.col('NET')
+                .mul(-1)
+                .alias('Demand Quantity')
+            )
+            .select('Sublot', 'Part Number', 'Demand Quantity')
+        )
+
+        sublots = demand.select('Sublot').unique().sort('Sublot')['Sublot'].to_list()
+        crates = crate_boms.select('Crate Number').unique().sort('Crate Number')['Crate Number'].to_list()
+
+        m = gp.Model('model 1')
+
+        x = m.addVars(crates, sublots, vtype=GRB.BINARY, name='x')      
+        z = m.addVars(parts, sublots, vtype=GRB.INTEGER, name='z')  
+
+        i = 0
+        for c in crates:
+            i += 1
+            m.addConstr(gp.quicksum(x[c, s] for s in sublots) == 1, name=f'c_{i}')
+
+        obj = 0 #gp.LinExpr
+
+        k = 0
+        for s in sublots:
+            k += 1
+
+            j = 0
+            for p in parts:
+                j += 1
+                sublot_demand = (
+                    demand
+                    .filter(pl.col('Sublot') == s)
+                    .filter(pl.col('Part Number') == p)
+                    .select('Demand Quantity')
+                    .sum().item()
+                )
+                print(f'part {p} has ({sublot_demand}) demand in sublot {s}')
+
+
+                temp_crates = crate_boms.select('Crate Number', 'Part Number', 'Crate Quantity').to_dicts()
+                print(temp_crates)
+
+                
+                print(crate_boms)
+
+                for c in crates:
+
+                    print(temp_crates[c, p])
+
+
+                m.addConstr(
+                    z[p, s] == gp.max_(
+                        (-sublot_demand
+                            + gp.quicksum(
+                                x[c, s] * 
+                                (crate_boms
+                                    .filter(pl.col('Part Number') == p)
+                                    .filter(pl.col('Crate Number') == c)
+                                    .select('Crate Quantity')
+                                    .sum().item()
+                                )
+                                for c in crates
+                            )
+                        )
+                        , constant=0
+                    )
+                    ,name=f'z_{j},{k}'
+                )
+
+        m.setObjective(obj, GRB.MINIMIZE)
+
+        m.optimize()
+
+        print(m.display())
+
+        for v in m.getVars():
+            
+            #print crate-sublot combos
+            if v.X == 1:
+                print('%s' % (v.VarName))
+
+
+def linear_program_OLD(demand, crate_boms):
+    
+    if crate_boms.is_empty():
+        print('all crates have been assigned sublots')
+    else:
+        demand = demand.with_columns(pl.col('Sublot').str.replace_all(' ', ''))
+
+        print('\n\n\n\n\nINSIDE DA LOOOOP\n\n')
+        print('crate boms')
+        print(crate_boms)
+        print('all demand')
+        print(demand)
+
+        # parts in shipped GCs
+        parts = crate_boms.select('Part Number').unique().sort('Part Number')
+
+        # filter demand for parts already shipped
+        demand = demand.filter(pl.col('Part Number').is_in(parts))
+        demand = (
+            demand.with_columns(
+                pl.col('NET')
+                .mul(-1)
+                .alias('Demand Quantity')
+            )
+            .select('Sublot', 'Part Number', 'Demand Quantity')
+        )
+
+        sublots = demand.select('Sublot').unique().sort('Sublot')
+
+        crates = crate_boms.select('Crate Number').unique().sort('Crate Number')
+
+        print('filtered demand')
+        print(demand)
+        print('parts')
+        print(parts)
+        print('sublots')
+        print(sublots)
+        print('crates')
+        print(crates)
+
+        crates = crates['Crate Number'].to_list()
+        sublots = sublots['Sublot'].to_list()
+        parts = parts['Part Number'].to_list()
+
+        print(crates)
+        print(sublots)
+        print(parts)
+
+
+        m = gp.Model('model 1')
+
+        x = m.addVars(crates, sublots, vtype=GRB.BINARY, name='x')        
+
+        i = 0
+        for c in crates:
+            i += 1
+            m.addConstr(gp.quicksum(x[c, s] for s in sublots) == 1, name=f'c_{i}')
+
+        obj = 0 #gp.LinExpr
+
+        i = 0
+        for s in sublots:
+            sublot_demand = (
+                demand
+                .filter(pl.col('Sublot') == s)
+                .select('Demand Quantity')
+                .sum().item()
+            )
+
+            print(f'total sublot {s} demand: {sublot_demand}')
+
+           # obj += - sublot_demand
+
+
+            for p in parts:
+                i += 1
+                part_obj = 0
+                sublot_demand = (
+                    demand
+                    .filter(pl.col('Sublot') == s)
+                    .filter(pl.col('Part Number') == p)
+                    .select('Demand Quantity')
+                    .sum().item()
+                )
+
+                print(f'sublot {s} has ({sublot_demand}) demand for {p}')
+
+                for c in crates:
+
+                    # check if part number p is in crate c
+                    # if part number is in crate, then add to objective
+
+                    crate_quantity = (
+                        crate_boms
+                        .filter(pl.col('Part Number') == p)
+                        .filter(pl.col('Crate Number') == c)
+                        .select('Crate Quantity')
+                        .sum().item()
+                    )
+
+                    if crate_quantity > 0:
+                        part_obj += crate_quantity * x[c, s]
+                        print(f'adding part {p} in crate {c}')
+                    else:
+                        print('    not in GC')
+                
+            #### z[]
+              
+                try:
+                    part_obj != 0
+                except Exception as error:
+                    ''
+                   # m.addConstr(z == max((part_obj - sublot_demand), 0), name=f'd_{i}')             
+
+
+
+        m.setObjective(obj, GRB.MINIMIZE)
+
+        m.optimize()
+
+        print(m.display())
+
+        for v in m.getVars():
+            
+            #print crate-sublot combos
+            if v.X == 1:
+                print('%s' % (v.VarName))
 
 def main():
 
@@ -134,10 +371,6 @@ def main():
         .sort('Container Number', 'Crate Number', 'Part Number')
     )
 
-    print('free crates')
-    print(free_crates)
-    print(free_crates.sum())
-
     sublots = (
         temp.group_by('Sublot')
         .agg(pl.col('Crate Quantity').sum())
@@ -147,7 +380,7 @@ def main():
         .sort('Sublot')
     )
 
-    temp_2 = (
+    unfulfilled_demand = (
         temp
         .join(sublots, how = 'inner', on = 'Sublot')
         .filter(pl.col('NET') < 0)
@@ -155,25 +388,21 @@ def main():
     )
 
     print('unfulfilled demand')
-    print(temp_2)
-    print(temp_2.sum())
-
-    print(sublot_demand.filter((pl.col('Part Number') == '1116GLT01-10-0001')).filter(pl.col('Sublot') == '2.02'))
-    print(temp.filter(pl.col('Sublot') == '2.02').sort('Part Number'))
-
-    print(crate_boms.filter(pl.col('Sublot') == '2.02').group_by('Crate Number', 'Part Number').agg(pl.col('Crate Quantity').sum()).sort('Crate Number', 'Part Number'))
-
+    print(unfulfilled_demand)
+    print(f'unfulfilled demand sum: {unfulfilled_demand.sum().select('NET').item()}')
 
     print('extras')
     print(temp.filter((pl.col('NET') > 0) & (pl.col('Sublot').is_not_null())))
 
     #print('missing')
     #print(temp.join().filter(pl.col('NET') < 0))
+    print('freee cratessss')
+    print(free_crates)
 
-    ## TO DO
-    # stack demand and crates
-    # group by part number and sublot and quantities to get parts in sublot vs. auto-assigned crates
-    # return list of extras and unfulfilled demand
+
+    linear_program(unfulfilled_demand, free_crates)
+
+
 
     # recommend sublots for mixed crates to go to
         # backfill in comparison to the MS dates?????
