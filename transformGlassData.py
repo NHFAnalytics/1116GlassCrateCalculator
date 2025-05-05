@@ -301,6 +301,9 @@ def main():
     print('\nextras')
     print(flat_demand_crates.filter(pl.col('NET') > 0))
 
+    print('\nunfulfilled demand')
+    print(unfulfilled_demand)
+
     if free_crates.is_empty():
         print('all crates assigned sublots!')
     else:
