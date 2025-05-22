@@ -37,26 +37,18 @@ def get_crate_data():
             sheet_name = 'Crate BOMs',
             schema_overrides={'PO Sublot': pl.Utf8, 'UPDATED Sublot': pl.Utf8}
         )
-        .rename({'crate no.': 'Crate Number', 'crate typ' : 'Crate Type', 'glass code' : 'Part Number', 'qty' : 'Crate Quantity'})
-        .select('Container Number', 'Crate Number', 'Crate Type', 'Part Number', 'Crate Quantity', 'PO Sublot', '# POs in Crate', 'UPDATED Sublot')
+        .rename({'crate no.': 'Crate Number', 'crate typ' : 'Crate Type', 'glass code' : 'Part Number', 'qty' : 'Crate Quantity', 'Single Column Sublot' : 'Sublot'})
+        .select('Container Number', 'Crate Number', 'Crate Type', 'Part Number', 'Crate Quantity', 'PO Sublot', '# POs in Crate', 'Sublot')
         .with_columns(
             pl.when(pl.col(pl.String).str.len_chars() == 0)
             .then(None)
             .otherwise(pl.col(pl.String))
             .name.keep()
         )
-        .with_columns(
-            pl.when(pl.col('# POs in Crate') == 1)
-            .then(pl.col('PO Sublot'))
-            .when(~pl.col('UPDATED Sublot').is_null())
-            .then(pl.col('UPDATED Sublot'))
-            .otherwise(None)
-            .alias('Sublot')
-        )
     )
 
     crates = crate_boms.select(pl.col('Crate Number', 'Crate Type', 'Container Number', 'Sublot')).unique()
-    crate_boms = crate_boms.drop('Crate Type', 'Container Number', 'UPDATED Sublot')
+    crate_boms = crate_boms.drop('Crate Type', 'Container Number')
 
     return containers, crates, crate_boms
 
@@ -122,7 +114,20 @@ def C_p(crate_boms, crate_number, part_number):
 
     return quantity
 
-def linear_program(demand, crate_boms):
+# E_p_s = already assigned # extras of part p in sublot s
+def E_p_s(extras, sublot, part_number):
+    
+    quantity = (
+        extras
+        .filter(pl.col('Sublot') == sublot)
+        .filter(pl.col('Part Number') == part_number)
+        .select('NET')
+        .sum().item()
+    )
+
+    return quantity
+
+def linear_program(demand, crate_boms, extras):
 
     demand = demand.with_columns(pl.col(pl.String).str.replace_all(' ', ''))
 
@@ -171,7 +176,7 @@ def linear_program(demand, crate_boms):
             j += 1
 
             ## y = quantity of part p in sublot s stack
-            m.addConstr(y[p,s] == gp.quicksum(x[c, s] * C_p(crate_boms,c,p) for c in crates), name=f'y_{j}_{k}')
+            m.addConstr(y[p,s] == (E_p_s(extras, s, p) + gp.quicksum(x[c, s] * C_p(crate_boms,c,p) for c in crates)), name=f'y_{j}_{k}')
 
             ## z = max(0, y - demand) = quantity of extras of part p in sublot s stack
             ##    z >= 0
@@ -295,19 +300,36 @@ def main():
         .sort('Sublot', 'Part Number')
     )
 
+    different_project_material = (
+        flat_demand_crates
+        .filter(~pl.col('Part Number').str.starts_with('1116'))
+    )
+
+    extras = (
+        flat_demand_crates
+        .filter(pl.col('NET') > 0)
+        .filter(pl.col('Part Number').str.starts_with('1116'))
+        .sort('Sublot', 'Part Number')
+    )
+
     print('\nfreee cratessss')
     print(free_crates)
 
     print('\nextras')
-    print(flat_demand_crates.filter(pl.col('NET') > 0))
+    print(extras)
 
     print('\nunfulfilled demand')
     print(unfulfilled_demand)
 
+    print('\nnon-CHOP material')
+    print(different_project_material)
+
+    print(unfulfilled_demand.filter(pl.col('Part Number') == '1116GLZ02-10-0004'))
+
     if free_crates.is_empty():
         print('all crates assigned sublots!')
     else:
-        linear_program(unfulfilled_demand, free_crates)
+        linear_program(unfulfilled_demand, free_crates, extras)
 
 
 
